@@ -35,7 +35,7 @@
 
 - stdio 传输，任何 MCP 客户端都能挂（Claude Desktop / Cursor / Hermes / VS Code Copilot）
 - Basic Auth 认证（7.3.6 无 PAT），支持自签证书（默认不校验 SSL）
-- 13 个工具：搜索 / 查询 / 建单 / 改单 / 流转 / 评论 / 项目与类型枚举 / 身份校验 / 保存筛选器 / 问题表格
+- 14 个工具：搜索 / 查询 / 建单 / 改单 / 流转 / 评论 / 项目与类型枚举 / 身份校验 / 保存筛选器 / 问题表格 / 缺陷克隆（clone++）
 - 服务端做 payload 精简，抗 LLM 工具结果截断
 
 ## 快速上手
@@ -120,6 +120,7 @@ PY
 | jira_list_transitions | 列可用的状态流转 |
 | jira_transition_issue | 按名称流转状态 |
 | jira_add_comment | 加评论 |
+| jira_clone_issue | 缺陷克隆 clone++（拷贝到手机APP联调项目 + Cloners 关联 + 拷贝评论/附件） |
 
 ---
 
@@ -163,13 +164,13 @@ PY
 ┌───────────────────────────────▼─────────────────────────────┐
 │  FastMCP("jira-gac")                ← MCP SDK 层             │
 │  ┌─────────────────────────────────────────────────────────┐ │
-│  │  13 个 @mcp.tool() 处理器                                │ │
+│  │  14 个 @mcp.tool() 处理器                                │ │
 │  │  jira_get_myself / jira_search / jira_list_filters /    │ │
 │  │  jira_search_by_filter / jira_issue_table /             │ │
 │  │  jira_get_issue / jira_create_issue / jira_update_issue │ │
 │  │  jira_list_transitions / jira_transition_issue /        │ │
 │  │  jira_add_comment / jira_list_projects /                │ │
-│  │  jira_get_issue_types                                   │ │
+│  │  jira_get_issue_types / jira_clone_issue                │ │
 │  └─────────────────────────────────────────────────────────┘ │
 │  ┌─────────────────────────────────────────────────────────┐ │
 │  │  JiraClient          ← HTTP 客户端层（requests.Session）│ │
@@ -309,6 +310,9 @@ def _err(e):    return {"ok": False, "error": str(e)}
 | `jira_list_transitions` | GET | `/issue/{key}/transitions` | 无 | `[{id,name}]` |
 | `jira_transition_issue` | POST | `/issue/{key}/transitions` | **有** | `{key,transitioned_to}` |
 | `jira_add_comment` | POST | `/issue/{key}/comment` | **有** | `{key,comment_id}` |
+| `jira_clone_issue` | GET+POST | `/issue` + `/issueLink` + `/comment` + `/attachments` | **有** | `{source,clone_key,url,vehicle_model,severity,link_created,copied,attachments_detail,attachment_job}` |
+| `jira_copy_attachments` | GET+POST | `/issue/{key}` + `/issue/{key}/attachments` | **有** | `{source,target,copied,failed,skipped,files[],job_id?}` |
+| `jira_attachment_job_status` | — | 进程内任务表 | 无 | `{job_id,status,result}` |
 
 ### 各工具设计要点
 
@@ -352,6 +356,48 @@ def _err(e):    return {"ok": False, "error": str(e)}
 - `list` 返回 `[{id, name}]`；
 - `transition` 支持按**名称或 id**定位目标流转（名称本地化，所以支持 id 兜底）；
 - 未命中 → 返回 `ok=false` 并列出**所有可用名称**，方便客户端纠正。
+
+**jira_clone_issue** — 缺陷克隆 clone++（PRD「测试账号缺陷分配」流程第 3 步）
+
+把源缺陷克隆到「手机APP联调项目」（默认 `T9MLBUG`，覆盖所有车型、按【影响车型】确定车型来源），
+用于把手机 App 类缺陷集中到联调项目里做前端/后端分析与分配。签名：
+
+```
+jira_clone_issue(source_key, target_project="T9MLBUG", vehicle_model="",
+                 app_system="", reproducibility="", severity="", app="传祺",
+                 component="", assignee="", copy_comments=True, copy_attachments=True,
+                 attachments_async=False, max_single_attach_mb=100)
+```
+
+流程：
+1. **读源**：只拉 `CLONE_SOURCE_FIELDS`（summary/description/priority/labels/components/
+   comment/attachment/project/issuetype），避免 175 KB 全量 payload。
+2. **定【影响车型】**：`vehicle_model` 入参优先；否则 `_guess_vehicle_model` 从源项目名推断
+   （去「项目质量问题/质量问题/项目」后缀后精确/唯一前缀匹配目标项目可选值）。推断不出 → 返回
+   `ok=false` 并列出全部可选值，由调用方（LLM）补传，**绝不带错值建单**。
+3. **补必填字段**：目标项目 `BUG` 类型的必填自定义字段（app系统/再现率/严重程度/APP）按入参
+   或默认值填充；严重程度缺省时按 `优先级 → 严重程度` 映射（`High→A_Critical`、`Medium→B_Major`…）。
+4. **建单**：`POST /issue`，复制 summary/description/priority/labels/组件。
+5. **关联**：`POST /issueLink`，`Cloners` 类型，`outwardIssue=源`、`inwardIssue=克隆`
+   （与 Jira 原生 clone 同向）。
+6. **clone++**：按需拷贝评论（加「克隆自 <源key>」前缀）与附件，best-effort，单条失败跳过不影响整体。
+   附件拷贝规则（**不再因总量大而整体跳过**）：
+
+   | 场景 | 行为 |
+   |------|------|
+   | 单条 issue 附件总量 ≤ `attachments_sync_limit_mb`（默认 15MB） | 同步拷贝，结果含逐文件状态 |
+   | 总量 > 15MB | 自动转**后台线程异步**拷贝（`attachments_async=True`），主流程先返回 `job_id`，不阻塞建单 |
+   | 单个附件 > `max_single_attach_mb`（默认 100MB） | 跳过该附件，并在结果里标注文件名与大小 |
+   | 下载/上传失败 | 自动重试 `ATTACH_RETRY`（默认 2 次），仍失败则记录 `error` 原因 |
+
+   实现要点：附件**流式落临时盘**再 multipart 重传（避免几十 MB 日志一次性进内存），
+   每轮结束删除临时文件（含重试场景），上传走 `X-Atlassian-Token: no-check` 绕过 XSRF。
+   漏传附件可用 `jira_copy_attachments(source_key, target_key)` 补拷，
+   异步任务用 `jira_attachment_job_status(job_id)` 查进度。
+
+字段 id 映射（实例专属常量，见 `server.py` 顶部）：`customfield_12009`=影响车型、
+`customfield_15405`=app系统、`customfield_11616`=再现率、`customfield_11600`=严重程度、
+`customfield_16000`=APP。若字段被重建，用 `GET /rest/api/2/field` 重新确认。
 
 ---
 
@@ -510,3 +556,4 @@ total, displayed, page, pageSize, startIndex, sortBy, columnConfig, columns, iss
 | `test_handshake.py` | stdio 握手 + 注册自测 |
 | `test_readonly.py` | 只读工具覆盖测试 |
 | `test_live.py` | 实连冒烟测试 |
+| `test_clone.py` | 缺陷克隆 clone++ 实连测试（真实建单，测试后请删除） |
